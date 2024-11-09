@@ -1,0 +1,186 @@
+#include <WiFiMulti.h>
+#include <InfluxDbClient.h>
+#include <InfluxDbCloud.h>
+#include <DHT.h>
+#include <HTTPClient.h>
+
+WiFiMulti wifiMulti;
+#define DEVICE "ESP32"
+#define WIFI_SSID "Harsha"
+#define WIFI_PASSWORD "12345678"
+#define INFLUXDB_URL "https://us-east-1-1.aws.cloud2.influxdata.com"
+#define INFLUXDB_TOKEN "rug5QqSa647zNUhB7_jiVM1rnJVM-ExyVyS7qP0GtD6FMrwLDFgzsVzK03fNcxqkxi3DMduwSP8PJjcOiPsEpg=="
+#define INFLUXDB_ORG "f313ddfb78a13f5e"
+#define INFLUXDB_BUCKET "CaseStudy"
+#define TZ_INFO "PKT-5"
+
+// Firebase settings
+#define FIREBASE_URL "https://casestudy-653f0-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define FIREBASE_API_KEY "AIzaSyBEewCpr65FizOr2GpcU275RpgHTWwc4ck"
+
+// DHT11 setup
+#define DHTPIN 26
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// MQ135 setup
+const int mq135Pin = 34;
+
+// InfluxDB client instance
+InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN, InfluxDbCloud2CACert);
+Point sensor("environment");
+
+// Random value generation functions
+float generateRandomUV() {
+  return 2.5 + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / (2.8 - 2.5)));
+}
+f`loat generateRandomPressure() {
+  return 1010.5 + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / (1011.3 - 1010.5)));
+}
+float generateRandomAltitude() {
+  return 432.4 + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / (432.7 - 432.4)));
+}
+
+// Structure to define tasks
+struct Task {
+  String name;
+  unsigned long period;
+  unsigned long deadline;
+  void (*taskFunction)();
+};
+
+// EDF task list
+Task tasks[3];
+int numTasks = 3;
+
+// Task functions
+void readSensors();
+void logToInfluxDB();
+void sendToFirebase(float temp, float humidity, int mq135Value, float uvIndex, float pressure, float altitude);
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  while (wifiMulti.run() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+
+  dht.begin();
+  sensor.addTag("device", DEVICE);
+  sensor.addTag("SSID", WiFi.SSID());
+
+  timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");
+  if (client.validateConnection()) {
+    Serial.print("Connected to InfluxDB: ");
+    Serial.println(client.getServerUrl());
+  } else {
+    Serial.print("InfluxDB connection failed: ");
+    Serial.println(client.getLastErrorMessage());
+  }
+
+  // Initialize tasks with periods and deadlines
+  tasks[0] = {"Read Sensors", 5000, millis() + 5000, readSensors};
+  tasks[1] = {"Log to InfluxDB", 5000, millis() + 5000, logToInfluxDB};
+  tasks[2] = {"Send to Firebase", 5000, millis() + 5000, []() {
+    float temp = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    int mq135Value = analogRead(mq135Pin);
+    float uvIndex = generateRandomUV();
+    float pressure = generateRandomPressure();
+    float altitude = generateRandomAltitude();
+    sendToFirebase(temp, humidity, mq135Value, uvIndex, pressure, altitude);
+  }};
+}
+
+void loop() {
+  // Find the task with the nearest deadline (EDF)
+  int nearestTaskIndex = -1;
+  unsigned long nearestDeadline = ULONG_MAX;
+
+  for (int i = 0; i < numTasks; i++) {
+    if (tasks[i].deadline < nearestDeadline) {
+      nearestDeadline = tasks[i].deadline;
+      nearestTaskIndex = i;
+    }
+  }
+
+  // Execute the task with the nearest deadline
+  if (nearestTaskIndex != -1) {
+    tasks[nearestTaskIndex].taskFunction();
+    tasks[nearestTaskIndex].deadline += tasks[nearestTaskIndex].period;
+  }
+
+  delay(100); // Small delay to prevent task overloading
+}
+
+void readSensors() {
+  float temp = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  if (isnan(temp) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+    return;
+  }
+
+  int mq135Value = analogRead(mq135Pin);
+  float uvIndex = generateRandomUV();
+  float pressure = generateRandomPressure();
+  float altitude = generateRandomAltitude();
+
+  sensor.addField("Temperature", temp);
+  sensor.addField("Humidity", humidity);
+  sensor.addField("AirQuality", mq135Value);
+  sensor.addField("UVIndex", uvIndex);
+  sensor.addField("Pressure", pressure);
+  sensor.addField("Altitude", altitude);
+
+  Serial.print("Temp: ");
+  Serial.print(temp);
+  Serial.print(" C, Humidity: ");
+  Serial.print(humidity);
+  Serial.print(" %, MQ135: ");
+  Serial.print(mq135Value);
+  Serial.print(", UV Index: ");
+  Serial.print(uvIndex);
+  Serial.print(", Pressure: ");
+  Serial.print(pressure);
+  Serial.print(" hPa, Altitude: ");
+  Serial.println(altitude);
+}
+
+void logToInfluxDB() {
+  if (!client.writePoint(sensor)) {
+    Serial.print("InfluxDB write failed: ");
+    Serial.println(client.getLastErrorMessage());
+  }
+}
+
+void sendToFirebase(float temp, float humidity, int mq135Value, float uvIndex, float pressure, float altitude) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String(FIREBASE_URL) + "/environment.json?auth=" + FIREBASE_API_KEY;
+    String payload = String("{\"temperature\":") + temp + 
+                     ",\"humidity\":" + humidity + 
+                     ",\"airquality\":" + mq135Value +
+                     ",\"uvindex\":" + uvIndex + 
+                     ",\"pressure\":" + pressure +
+                     ",\"altitude\":" + altitude + "}";
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    int httpResponseCode = http.PUT(payload);
+
+    if (httpResponseCode > 0) {
+      Serial.print("Firebase response: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Error sending to Firebase: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
+}
